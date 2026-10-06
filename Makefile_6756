@@ -1,0 +1,15 @@
+# Makefile_6756 - NetMessenger (IT23676756)
+.RECIPEPREFIX = >
+CC = gcc
+CFLAGS = -Wall -Wextra -g -pthread
+
+all: server_6756 client_6756
+
+server_6756: server_6756.c
+> $(CC) $(CFLAGS) -o server_6756 server_6756.c
+
+client_6756: client_6756.c
+> $(CC) $(CFLAGS) -o client_6756 client_6756.c
+
+clean:
+> rm -f server_6756 client_6756
