@@ -31,6 +31,7 @@
 #define MAX_NAME    32
 #define BUF_SIZE    4096      /* per-client receive buffer = longest allowed line */
 #define OUT_SIZE    8192      /* outgoing line buffer */
+#define MAX_ROOMS_PER_CLIENT 8   /* a client can be in at most 8 rooms */
 
 /* ---------- per-client state ---------- */
 typedef struct {
@@ -42,6 +43,8 @@ typedef struct {
     int    port;
     char   buf[BUF_SIZE];     /* bytes received but not yet processed */
     size_t buf_len;
+    char   rooms[MAX_ROOMS_PER_CLIENT][MAX_NAME]; /* rooms this client has joined */
+    int    nrooms;
     pthread_mutex_t send_lock;/* stops two threads mixing bytes on one socket */
 } Client;
 
@@ -102,6 +105,19 @@ static void reply(Client *c, const char *fmt, ...)
     vsnprintf(body, sizeof body, fmt, ap);
     va_end(ap);
     int n = snprintf(line, sizeof line, "%s " NID "\n", body);
+    if (n >= (int)sizeof line) n = (int)sizeof line - 1;
+    send_all(c, line, (size_t)n);
+}
+
+/* send ONE MSG line to ONE client: NO NID tag */
+static void send_msg(Client *c, const char *fmt, ...)
+{
+    char body[OUT_SIZE - 2], line[OUT_SIZE];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(body, sizeof body, fmt, ap);
+    va_end(ap);
+    int n = snprintf(line, sizeof line, "%s\n", body);
     if (n >= (int)sizeof line) n = (int)sizeof line - 1;
     send_all(c, line, (size_t)n);
 }
@@ -214,6 +230,154 @@ static void cmd_list(Client *c)
     reply(c, "OK USERS %s", list);
 }
 
+/* split "word rest of line": returns the first word, *rest = what follows */
+static char *split_arg(char *s, char **rest)
+{
+    char *sp = strchr(s, ' ');
+    if (sp) {
+        *sp++ = '\0';
+        while (*sp == ' ') sp++;
+        *rest = sp;
+    } else {
+        *rest = s + strlen(s);
+    }
+    return s;
+}
+
+/* --- room helpers: the caller MUST already hold g_lock --- */
+static int in_room(const Client *c, const char *room)
+{
+    for (int j = 0; j < c->nrooms; j++)
+        if (strcmp(c->rooms[j], room) == 0) return j;
+    return -1;
+}
+
+/* a room exists as long as at least one client is inside it */
+static int room_exists(const char *room)
+{
+    for (int i = 0; i < MAX_CLIENTS; i++)
+        if (clients[i].in_use && clients[i].registered &&
+            in_room(&clients[i], room) >= 0) return 1;
+    return 0;
+}
+
+static void cmd_bcast(Client *c, const char *msg)
+{
+    if (*msg == '\0') { reply(c, "ERR 015 MISSING_ARGUMENT"); return; }
+    broadcast_except(c, "MSG BCAST %s %s", c->name, msg);
+    reply(c, "OK SENT");
+    log_event("BCAST from=%s bytes=%zu", c->name, strlen(msg));
+}
+
+static void cmd_pmsg(Client *c, char *args)
+{
+    char *msg;
+    char *target = split_arg(args, &msg);
+    if (*target == '\0' || *msg == '\0') { reply(c, "ERR 015 MISSING_ARGUMENT"); return; }
+
+    int found = 0;
+    pthread_mutex_lock(&g_lock);
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        if (clients[i].in_use && clients[i].registered &&
+            strcmp(clients[i].name, target) == 0) {
+            send_msg(&clients[i], "MSG PRIV %s %s", c->name, msg);
+            found = 1;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_lock);
+
+    if (!found) { reply(c, "ERR 002 USER_NOT_FOUND"); return; }
+    reply(c, "OK SENT");
+    log_event("PMSG from=%s to=%s bytes=%zu", c->name, target, strlen(msg));
+}
+
+static void cmd_join(Client *c, const char *room)
+{
+    if (!valid_name(room)) { reply(c, "ERR 013 INVALID_ROOM_NAME"); return; }
+
+    int too_many = 0;
+    pthread_mutex_lock(&g_lock);
+    if (in_room(c, room) < 0) {                    /* not a member yet */
+        if (c->nrooms >= MAX_ROOMS_PER_CLIENT)
+            too_many = 1;
+        else
+            snprintf(c->rooms[c->nrooms++], MAX_NAME, "%s", room);
+    }                                              /* room is created by its first member */
+    pthread_mutex_unlock(&g_lock);
+
+    if (too_many) { reply(c, "ERR 014 TOO_MANY_ROOMS"); return; }
+    reply(c, "OK JOINED %s", room);
+    log_event("JOIN user=%s room=%s", c->name, room);
+}
+
+static void cmd_leave(Client *c, const char *room)
+{
+    pthread_mutex_lock(&g_lock);
+    int idx = in_room(c, room);
+    if (idx >= 0) {
+        for (int j = idx; j < c->nrooms - 1; j++)  /* close the gap in the array */
+            memcpy(c->rooms[j], c->rooms[j + 1], MAX_NAME);
+        c->nrooms--;
+    }
+    pthread_mutex_unlock(&g_lock);
+
+    if (idx < 0) { reply(c, "ERR 003 ROOM_NOT_FOUND"); return; }
+    reply(c, "OK LEFT %s", room);
+    log_event("LEAVE user=%s room=%s", c->name, room);
+}
+
+static void cmd_rooms(Client *c)
+{
+    char list[BUF_SIZE];
+    const char *seen[MAX_CLIENTS * MAX_ROOMS_PER_CLIENT];
+    int nseen = 0;
+    size_t len = 0;
+    list[0] = '\0';
+
+    pthread_mutex_lock(&g_lock);
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        if (!clients[i].in_use || !clients[i].registered) continue;
+        for (int j = 0; j < clients[i].nrooms; j++) {
+            const char *r = clients[i].rooms[j];
+            int dup = 0;
+            for (int k = 0; k < nseen; k++)
+                if (strcmp(seen[k], r) == 0) { dup = 1; break; }
+            if (dup) continue;                     /* list each room only once */
+            seen[nseen++] = r;
+            len += (size_t)snprintf(list + len, sizeof list - len, "%s%s",
+                                    nseen > 1 ? "," : "", r);
+        }
+    }
+    pthread_mutex_unlock(&g_lock);
+
+    if (nseen == 0) reply(c, "OK ROOMS");
+    else            reply(c, "OK ROOMS %s", list);
+}
+
+static void cmd_rmsg(Client *c, char *args)
+{
+    char *msg;
+    char *room = split_arg(args, &msg);
+    if (*room == '\0' || *msg == '\0') { reply(c, "ERR 015 MISSING_ARGUMENT"); return; }
+
+    pthread_mutex_lock(&g_lock);
+    int exists = room_exists(room);
+    int member = (in_room(c, room) >= 0);
+    if (exists && member) {
+        for (int i = 0; i < MAX_CLIENTS; i++)
+            if (clients[i].in_use && clients[i].registered &&
+                &clients[i] != c && in_room(&clients[i], room) >= 0)
+                send_msg(&clients[i], "MSG ROOM %s %s %s", room, c->name, msg);
+    }
+    pthread_mutex_unlock(&g_lock);
+
+    if (!exists)      { reply(c, "ERR 003 ROOM_NOT_FOUND"); return; }
+    if (!member)      { reply(c, "ERR 011 NOT_IN_ROOM");    return; }
+    reply(c, "OK SENT");
+    log_event("RMSG from=%s room=%s bytes=%zu", c->name, room, strlen(msg));
+}
+
 /* returns 1 if the connection should be closed */
 static int handle_command(Client *c, char *line)
 {
@@ -238,9 +402,14 @@ static int handle_command(Client *c, char *line)
         reply(c, "ERR 006 NOT_REGISTERED");
         return 0;
     }
-    if (strcmp(cmd, "LIST") == 0) {
-        cmd_list(c);
-    } else {
+    if (strcmp(cmd, "LIST") == 0)           cmd_list(c);
+    else if (strcmp(cmd, "BCAST") == 0)     cmd_bcast(c, rest);
+    else if (strcmp(cmd, "PMSG") == 0)      cmd_pmsg(c, rest);
+    else if (strcmp(cmd, "JOIN") == 0)      cmd_join(c, rest);
+    else if (strcmp(cmd, "LEAVE") == 0)     cmd_leave(c, rest);
+    else if (strcmp(cmd, "ROOMS") == 0)     cmd_rooms(c);
+    else if (strcmp(cmd, "RMSG") == 0)      cmd_rmsg(c, rest);
+    else {
         reply(c, "ERR 007 UNKNOWN_COMMAND");
     }
     return 0;
@@ -270,6 +439,7 @@ static void *client_thread(void *arg)
     snprintf(name, sizeof name, "%s", c->name);
     c->registered = 0;
     c->name[0] = '\0';
+    c->nrooms = 0;                  /* leaves every room */
     close(c->fd);
     c->fd = -1;
     c->in_use = 0;
@@ -331,6 +501,7 @@ int main(void)
             c->registered = 0;
             c->name[0] = '\0';
             c->buf_len = 0;
+            c->nrooms = 0;
             inet_ntop(AF_INET, &ca.sin_addr, c->ip, sizeof c->ip);
             c->port = ntohs(ca.sin_port);
         }
