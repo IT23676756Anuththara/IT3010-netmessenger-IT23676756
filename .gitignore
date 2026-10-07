@@ -4,3 +4,4 @@ storage/
 *.o
 *.log
 downloads/
+big.bin
