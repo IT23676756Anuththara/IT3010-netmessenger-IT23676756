@@ -16,6 +16,7 @@
 #include <ctype.h>
 #include <pthread.h>
 #include <sys/types.h>
+#include <sys/stat.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -32,6 +33,8 @@
 #define BUF_SIZE    4096      /* per-client receive buffer = longest allowed line */
 #define OUT_SIZE    8192      /* outgoing line buffer */
 #define MAX_ROOMS_PER_CLIENT 8   /* a client can be in at most 8 rooms */
+#define MAX_FILE_SIZE (10ULL * 1024 * 1024)   /* 10 MB limit for SENDFILE */
+#define STORAGE_ROOT  "./storage/" REG_NO       /* ./storage/IT23676756 */
 
 /* ---------- per-client state ---------- */
 typedef struct {
@@ -78,22 +81,28 @@ static void log_event(const char *fmt, ...)
 }
 
 /* ================= sending ================= */
-/* send every byte (send() may send only part of the data) */
-static int send_all(Client *c, const char *data, size_t len)
+/* send every byte on a socket (send() may send only part of the data) */
+static int send_raw(int fd, const char *data, size_t len)
 {
     size_t sent = 0;
-    pthread_mutex_lock(&c->send_lock);
     while (sent < len) {
-        ssize_t n = send(c->fd, data + sent, len - sent, MSG_NOSIGNAL);
+        ssize_t n = send(fd, data + sent, len - sent, MSG_NOSIGNAL);
         if (n < 0) {
             if (errno == EINTR) continue;
-            pthread_mutex_unlock(&c->send_lock);
             return -1;
         }
         sent += (size_t)n;
     }
-    pthread_mutex_unlock(&c->send_lock);
     return 0;
+}
+
+/* same, but takes the client's send lock so lines never get mixed up */
+static int send_all(Client *c, const char *data, size_t len)
+{
+    pthread_mutex_lock(&c->send_lock);
+    int r = send_raw(c->fd, data, len);
+    pthread_mutex_unlock(&c->send_lock);
+    return r;
 }
 
 /* OK / ERR responses: always end with " NID:6767\n" */
@@ -378,6 +387,192 @@ static void cmd_rmsg(Client *c, char *args)
     log_event("RMSG from=%s room=%s bytes=%zu", c->name, room, strlen(msg));
 }
 
+/* ================= SENDFILE ================= */
+/* digits only, fits in unsigned long long */
+static int parse_size(const char *s, unsigned long long *out)
+{
+    if (*s == '\0') return 0;
+    for (const char *p = s; *p; p++)
+        if (!isdigit((unsigned char)*p)) return 0;
+    errno = 0;
+    unsigned long long v = strtoull(s, NULL, 10);
+    if (errno == ERANGE) return 0;
+    *out = v;
+    return 1;
+}
+
+/* safe file names only: stops "../../etc/passwd" style path tricks */
+static int valid_filename(const char *s)
+{
+    size_t len = strlen(s);
+    if (len == 0 || len > 100 || s[0] == '.') return 0;
+    for (size_t i = 0; i < len; i++)
+        if (!isalnum((unsigned char)s[i]) && s[i] != '.' && s[i] != '_' && s[i] != '-')
+            return 0;
+    return 1;
+}
+
+/*
+ * Consume EXACTLY n bytes from the client: first the bytes that already
+ * arrived together with the command line (c->buf), then more recv() calls
+ * (as many as it takes).  If 'out' != NULL the bytes are written to it,
+ * otherwise they are thrown away (used when we must reject the file but
+ * still keep the byte stream in sync).
+ * Returns 1 = all n bytes consumed, 0 = connection lost.
+ */
+static int consume_bytes(Client *c, unsigned long long n, FILE *out, int *werr)
+{
+    char chunk[BUF_SIZE];
+    while (n > 0) {
+        size_t got;
+        if (c->buf_len > 0) {
+            got = (c->buf_len < n) ? c->buf_len : (size_t)n;
+            if (out && !*werr && fwrite(c->buf, 1, got, out) != got) *werr = 1;
+            memmove(c->buf, c->buf + got, c->buf_len - got);
+            c->buf_len -= got;
+        } else {
+            size_t want = (n < sizeof chunk) ? (size_t)n : sizeof chunk;
+            ssize_t r = recv(c->fd, chunk, want, 0);
+            if (r == 0) return 0;
+            if (r < 0) {
+                if (errno == EINTR) continue;
+                return 0;
+            }
+            got = (size_t)r;
+            if (out && !*werr && fwrite(chunk, 1, got, out) != got) *werr = 1;
+        }
+        n -= got;
+    }
+    return 1;
+}
+
+/* send header line + the stored file to one client, as ONE uninterrupted block */
+static void deliver_file(Client *dst, const char *header, const char *path)
+{
+    FILE *fp = fopen(path, "rb");
+    if (!fp) return;
+    char chunk[BUF_SIZE];
+    size_t n;
+
+    pthread_mutex_lock(&dst->send_lock);
+    int ok = (send_raw(dst->fd, header, strlen(header)) == 0);
+    while (ok && (n = fread(chunk, 1, sizeof chunk, fp)) > 0)
+        ok = (send_raw(dst->fd, chunk, n) == 0);
+    pthread_mutex_unlock(&dst->send_lock);
+    fclose(fp);
+}
+
+/* returns 1 if the connection was lost while receiving the file */
+static int cmd_sendfile(Client *c, char *args)
+{
+    char *r1, *sizestr;
+    char *target = split_arg(args, &r1);
+    char *fname  = split_arg(r1, &sizestr);
+    unsigned long long size;
+
+    if (*target == '\0' || *fname == '\0' || *sizestr == '\0') {
+        reply(c, "ERR 015 MISSING_ARGUMENT");
+        return 0;
+    }
+    if (!parse_size(sizestr, &size)) {      /* cannot know how many bytes follow */
+        reply(c, "ERR 016 INVALID_FILESIZE");
+        return 0;
+    }
+
+    /* ---- checks that reject the file: the bytes must still be read and dropped ---- */
+    int err = 0;
+    const char *errmsg = NULL;
+    int kind = 0;                            /* 1 = user, 2 = room */
+
+    if (size > MAX_FILE_SIZE) {
+        err = 1; errmsg = "ERR 004 FILE_TOO_LARGE";
+    } else if (!valid_filename(fname)) {
+        err = 1; errmsg = "ERR 017 INVALID_FILENAME";
+    } else {
+        pthread_mutex_lock(&g_lock);
+        for (int i = 0; i < MAX_CLIENTS; i++)
+            if (clients[i].in_use && clients[i].registered &&
+                strcmp(clients[i].name, target) == 0) { kind = 1; break; }
+        if (!kind && room_exists(target)) {
+            if (in_room(c, target) >= 0) kind = 2;
+            else { err = 1; errmsg = "ERR 011 NOT_IN_ROOM"; }
+        } else if (!kind) {
+            err = 1; errmsg = "ERR 002 USER_NOT_FOUND";
+        }
+        pthread_mutex_unlock(&g_lock);
+    }
+
+    int werr = 0;
+    if (err) {
+        if (!consume_bytes(c, size, NULL, &werr)) return 1;   /* drop the bytes */
+        reply(c, "%s", errmsg);
+        log_event("SENDFILE rejected from=%s target=%s file=%s: %s", c->name, target, fname, errmsg);
+        return 0;
+    }
+
+    /* ---- store ./storage/IT23676756/<sender>/<filename> ---- */
+    char dir[256], path[512];
+    (void)mkdir("./storage", 0755);
+    (void)mkdir(STORAGE_ROOT, 0755);
+    snprintf(dir, sizeof dir, "%s/%s", STORAGE_ROOT, c->name);
+    snprintf(path, sizeof path, "%s/%s", dir, fname);
+    if (mkdir(dir, 0755) < 0 && errno != EEXIST) path[0] = '\0';
+
+    FILE *fp = path[0] ? fopen(path, "wb") : NULL;
+    if (!fp) {
+        if (!consume_bytes(c, size, NULL, &werr)) return 1;
+        reply(c, "ERR 018 STORAGE_ERROR");
+        log_event("SENDFILE storage error from=%s file=%s", c->name, fname);
+        return 0;
+    }
+    int alive = consume_bytes(c, size, fp, &werr);   /* exactly 'size' bytes */
+    fclose(fp);
+    if (!alive) {                                    /* sender died mid-transfer */
+        unlink(path);
+        log_event("SENDFILE aborted (sender lost) from=%s file=%s", c->name, fname);
+        return 1;
+    }
+    if (werr) {
+        unlink(path);
+        reply(c, "ERR 018 STORAGE_ERROR");
+        return 0;
+    }
+
+    /* ---- forward to the target(s) ---- */
+    char header[512];
+    int delivered = 0;
+    pthread_mutex_lock(&g_lock);
+    if (kind == 1) {
+        for (int i = 0; i < MAX_CLIENTS; i++) {
+            if (clients[i].in_use && clients[i].registered &&
+                strcmp(clients[i].name, target) == 0) {
+                snprintf(header, sizeof header, "MSG FILE PRIV %s %s %llu\n",
+                         c->name, fname, size);
+                deliver_file(&clients[i], header, path);
+                delivered = 1;
+                break;
+            }
+        }
+    } else {
+        snprintf(header, sizeof header, "MSG FILE ROOM %s %s %s %llu\n",
+                 target, c->name, fname, size);
+        for (int i = 0; i < MAX_CLIENTS; i++) {
+            if (clients[i].in_use && clients[i].registered &&
+                &clients[i] != c && in_room(&clients[i], target) >= 0) {
+                deliver_file(&clients[i], header, path);
+            }
+        }
+        delivered = 1;   /* an empty room (only the sender) is still a successful upload */
+    }
+    pthread_mutex_unlock(&g_lock);
+
+    if (!delivered) { reply(c, "ERR 002 USER_NOT_FOUND"); return 0; }
+    reply(c, "OK FILE_RECEIVED %s", fname);
+    log_event("SENDFILE from=%s target=%s file=%s bytes=%llu stored=%s",
+              c->name, target, fname, size, path);
+    return 0;
+}
+
 /* returns 1 if the connection should be closed */
 static int handle_command(Client *c, char *line)
 {
@@ -409,6 +604,7 @@ static int handle_command(Client *c, char *line)
     else if (strcmp(cmd, "LEAVE") == 0)     cmd_leave(c, rest);
     else if (strcmp(cmd, "ROOMS") == 0)     cmd_rooms(c);
     else if (strcmp(cmd, "RMSG") == 0)      cmd_rmsg(c, rest);
+    else if (strcmp(cmd, "SENDFILE") == 0)  return cmd_sendfile(c, rest);
     else {
         reply(c, "ERR 007 UNKNOWN_COMMAND");
     }
